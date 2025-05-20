@@ -1,7 +1,6 @@
 import { readFileSync, mkdirSync, writeFileSync} from 'fs';
 import { Examples } from '../utils/examples.js';
 import { getCommandDocs } from '../agent/commands/index.js';
-import { getSkillDocs } from '../agent/library/index.js';
 import { SkillLibrary } from "../agent/library/skill_library.js";
 import { stringifyTurns } from '../utils/text.js';
 import { getCommand } from '../agent/commands/index.js';
@@ -19,7 +18,16 @@ import { HuggingFace } from './huggingface.js';
 import { Qwen } from "./qwen.js";
 import { Grok } from "./grok.js";
 import { DeepSeek } from './deepseek.js';
+import { Hyperbolic } from './hyperbolic.js';
+import { GLHF } from './glhf.js';
 import { OpenRouter } from './openrouter.js';
+import { VLLM } from './vllm.js';
+import { promises as fs } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export class Prompter {
     constructor(agent, fp) {
@@ -40,7 +48,6 @@ export class Prompter {
                 this.profile[key] = base_profile[key];
         }
         // base overrides default, individual overrides base
-
 
         this.convo_examples = null;
         this.coding_examples = null;
@@ -64,6 +71,14 @@ export class Prompter {
         }
         else {
             this.code_model = this.chat_model;
+        }
+
+        if (this.profile.vision_model) {
+            let vision_model_profile = this._selectAPI(this.profile.vision_model);
+            this.vision_model = this._createModel(vision_model_profile);
+        }
+        else {
+            this.vision_model = this.chat_model;
         }
 
         let embedding = this.profile.embedding;
@@ -121,10 +136,14 @@ export class Prompter {
             profile = {model: profile};
         }
         if (!profile.api) {
-            if (profile.model.includes('gemini'))
+            if (profile.model.includes('openrouter/'))
+                profile.api = 'openrouter'; // must do first because shares names with other models
+            else if (profile.model.includes('ollama/'))
+                profile.api = 'ollama'; // also must do early because shares names with other models
+            else if (profile.model.includes('gemini'))
                 profile.api = 'google';
-            else if (profile.model.includes('openrouter/'))
-                profile.api = 'openrouter'; // must do before others bc shares model names
+            else if (profile.model.includes('vllm/'))
+                profile.api = 'vllm';
             else if (profile.model.includes('gpt') || profile.model.includes('o1')|| profile.model.includes('o3'))
                 profile.api = 'openai';
             else if (profile.model.includes('claude'))
@@ -137,6 +156,10 @@ export class Prompter {
                 model_profile.api = 'mistral';
             else if (profile.model.includes("groq/") || profile.model.includes("groqcloud/"))
                 profile.api = 'groq';
+            else if (profile.model.includes("glhf/"))
+                profile.api = 'glhf';
+            else if (profile.model.includes("hyperbolic/"))
+                profile.api = 'hyperbolic';
             else if (profile.model.includes('novita/'))
                 profile.api = 'novita';
             else if (profile.model.includes('qwen'))
@@ -145,14 +168,13 @@ export class Prompter {
                 profile.api = 'xai';
             else if (profile.model.includes('deepseek'))
                 profile.api = 'deepseek';
-            else if (profile.model.includes('llama3'))
-                profile.api = 'ollama';
+	        else if (profile.model.includes('mistral'))
+                profile.api = 'mistral';
             else 
                 throw new Error('Unknown model:', profile.model);
         }
         return profile;
     }
-
     _createModel(profile) {
         let model = null;
         if (profile.api === 'google')
@@ -164,13 +186,17 @@ export class Prompter {
         else if (profile.api === 'replicate')
             model = new ReplicateAPI(profile.model.replace('replicate/', ''), profile.url, profile.params);
         else if (profile.api === 'ollama')
-            model = new Local(profile.model, profile.url, profile.params);
+            model = new Local(profile.model.replace('ollama/', ''), profile.url, profile.params);
         else if (profile.api === 'mistral')
             model = new Mistral(profile.model, profile.url, profile.params);
         else if (profile.api === 'groq')
             model = new GroqCloudAPI(profile.model.replace('groq/', '').replace('groqcloud/', ''), profile.url, profile.params);
         else if (profile.api === 'huggingface')
             model = new HuggingFace(profile.model, profile.url, profile.params);
+        else if (profile.api === 'glhf')
+            model = new GLHF(profile.model.replace('glhf/', ''), profile.url, profile.params);
+        else if (profile.api === 'hyperbolic')
+            model = new Hyperbolic(profile.model.replace('hyperbolic/', ''), profile.url, profile.params);
         else if (profile.api === 'novita')
             model = new Novita(profile.model.replace('novita/', ''), profile.url, profile.params);
         else if (profile.api === 'qwen')
@@ -181,11 +207,12 @@ export class Prompter {
             model = new DeepSeek(profile.model, profile.url, profile.params);
         else if (profile.api === 'openrouter')
             model = new OpenRouter(profile.model.replace('openrouter/', ''), profile.url, profile.params);
+        else if (profile.api === 'vllm')
+            model = new VLLM(profile.model.replace('vllm/', ''), profile.url, profile.params);
         else
             throw new Error('Unknown API:', profile.api);
         return model;
     }
-
     getName() {
         return this.profile.name;
     }
@@ -234,7 +261,7 @@ export class Prompter {
             prompt = prompt.replaceAll('$ACTION', this.agent.actions.currentActionLabel);
         }
         if (prompt.includes('$COMMAND_DOCS'))
-            prompt = prompt.replaceAll('$COMMAND_DOCS', getCommandDocs());
+            prompt = prompt.replaceAll('$COMMAND_DOCS', getCommandDocs(this.agent));
         if (prompt.includes('$CODE_DOCS')) {
             const code_task_content = messages.slice().reverse().find(msg =>
                 msg.role !== 'system' && msg.content.includes('!newAction(')
@@ -245,9 +272,6 @@ export class Prompter {
                 await this.skill_libary.getRelevantSkillDocs(code_task_content, settings.relevant_docs_count)
             );
         }
-            prompt = prompt.replaceAll('$COMMAND_DOCS', getCommandDocs());
-        if (prompt.includes('$CODE_DOCS'))
-            prompt = prompt.replaceAll('$CODE_DOCS', getSkillDocs());
         if (prompt.includes('$EXAMPLES') && examples !== null)
             prompt = prompt.replaceAll('$EXAMPLES', await examples.createExampleMessage(messages));
         if (prompt.includes('$MEMORY'))
@@ -300,26 +324,50 @@ export class Prompter {
     async promptConvo(messages) {
         this.most_recent_msg_time = Date.now();
         let current_msg_time = this.most_recent_msg_time;
+
         for (let i = 0; i < 3; i++) { // try 3 times to avoid hallucinations
             await this.checkCooldown();
             if (current_msg_time !== this.most_recent_msg_time) {
                 return '';
             }
+
             let prompt = this.profile.conversing;
             prompt = await this.replaceStrings(prompt, messages, this.convo_examples);
-            let generation = await this.chat_model.sendRequest(messages, prompt);
-            // in conversations >2 players LLMs tend to hallucinate and role-play as other bots
-            // the FROM OTHER BOT tag should never be generated by the LLM
-            if (generation.includes('(FROM OTHER BOT)')) {
+            let generation;
+
+            try {
+                generation = await this.chat_model.sendRequest(messages, prompt);
+                if (typeof generation !== 'string') {
+                    console.error('Error: Generated response is not a string', generation);
+                    throw new Error('Generated response is not a string');
+                }
+                console.log("Generated response:", generation); 
+                await this._saveLog(prompt, messages, generation, 'conversation');
+
+            } catch (error) {
+                console.error('Error during message generation or file writing:', error);
+                continue;
+            }
+
+            // Check for hallucination or invalid output
+            if (generation?.includes('(FROM OTHER BOT)')) {
                 console.warn('LLM hallucinated message as another bot. Trying again...');
                 continue;
             }
+
             if (current_msg_time !== this.most_recent_msg_time) {
-                console.warn(this.agent.name + ' received new message while generating, discarding old response.');
+                console.warn(`${this.agent.name} received new message while generating, discarding old response.`);
                 return '';
+            } 
+
+            if (generation?.includes('</think>')) {
+                const [_, afterThink] = generation.split('</think>')
+                generation = afterThink
             }
+
             return generation;
         }
+
         return '';
     }
 
@@ -332,8 +380,10 @@ export class Prompter {
         await this.checkCooldown();
         let prompt = this.profile.coding;
         prompt = await this.replaceStrings(prompt, messages, this.coding_examples);
+
         let resp = await this.code_model.sendRequest(messages, prompt);
         this.awaiting_coding = false;
+        await this._saveLog(prompt, messages, resp, 'coding');
         return resp;
     }
 
@@ -341,7 +391,13 @@ export class Prompter {
         await this.checkCooldown();
         let prompt = this.profile.saving_memory;
         prompt = await this.replaceStrings(prompt, null, null, to_summarize);
-        return await this.chat_model.sendRequest([], prompt);
+        let resp = await this.chat_model.sendRequest([], prompt);
+        await this._saveLog(prompt, to_summarize, resp, 'memSaving');
+        if (resp?.includes('</think>')) {
+            const [_, afterThink] = resp.split('</think>')
+            resp = afterThink
+        }
+        return resp;
     }
 
     async promptShouldRespondToBot(new_message) {
@@ -354,7 +410,15 @@ export class Prompter {
         return res.trim().toLowerCase() === 'respond';
     }
 
+    async promptVision(messages, imageBuffer) {
+        await this.checkCooldown();
+        let prompt = this.profile.image_analysis;
+        prompt = await this.replaceStrings(prompt, messages, null, null, null);
+        return await this.vision_model.sendVisionRequest(messages, prompt, imageBuffer);
+    }
+
     async promptGoalSetting(messages, last_goals) {
+        // deprecated
         let system_message = this.profile.goal_setting;
         system_message = await this.replaceStrings(system_message, messages);
 
@@ -379,4 +443,36 @@ export class Prompter {
         goal.quantity = parseInt(goal.quantity);
         return goal;
     }
+
+    async _saveLog(prompt, messages, generation, tag) {
+        if (!settings.log_all_prompts)
+            return;
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        let logEntry;
+        let task_id = this.agent.task.task_id;
+        if (task_id == null) {
+            logEntry = `[${timestamp}] \nPrompt:\n${prompt}\n\nConversation:\n${JSON.stringify(messages, null, 2)}\n\nResponse:\n${generation}\n\n`;
+        } else {
+            logEntry = `[${timestamp}] Task ID: ${task_id}\nPrompt:\n${prompt}\n\nConversation:\n${JSON.stringify(messages, null, 2)}\n\nResponse:\n${generation}\n\n`;
+        }
+        const logFile = `${tag}_${timestamp}.txt`;
+        await this._saveToFile(logFile, logEntry);
+    }
+
+    async _saveToFile(logFile, logEntry) {
+        let task_id = this.agent.task.task_id;
+        let logDir;
+        if (task_id == null) {
+            logDir = path.join(__dirname, `../../bots/${this.agent.name}/logs`);
+        } else {
+            logDir = path.join(__dirname, `../../bots/${this.agent.name}/logs/${task_id}`);
+        }
+
+        await fs.mkdir(logDir, { recursive: true });
+
+        logFile = path.join(logDir, logFile);
+        await fs.appendFile(logFile, String(logEntry), 'utf-8');
+    }
+
+
 }
